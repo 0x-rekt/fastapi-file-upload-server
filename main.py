@@ -2,7 +2,6 @@ import os
 import re
 import io
 import json
-import base64
 import httpx
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
@@ -175,11 +174,12 @@ def upload_to_imagekit(file_bytes: bytes, filename: str) -> str:
 
     imagekitio v5 API:
       - Upload is on the `.files` sub-resource
+      - The `file` parameter must be bytes, an io.IOBase instance, or a PathLike.
+        A base64-encoded string is NOT accepted by the SDK.
       - CDN URL = url_endpoint.rstrip('/') + '/' + result.file_path.lstrip('/')
     """
-    b64 = base64.b64encode(file_bytes).decode("utf-8")
     result = imagekit.files.upload(
-        file=b64,
+        file=io.BytesIO(file_bytes),
         file_name=filename,
     )
     # Build the public CDN URL from the endpoint + the path returned by the API
