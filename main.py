@@ -4,7 +4,7 @@ import io
 import json
 import httpx
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -118,6 +118,42 @@ Needs Improvement (1–3 weaknesses)
 }
 """
 
+COVER_LETTER_SYSTEM_PROMPT = """You are an advanced AI Cover Letter Generator.
+
+Your task is to write a personalized cover letter based on a candidate's resume and a job description. Return the output as a JSON object following this exact schema:
+
+{
+  "intro": string,
+  "body": string,
+  "closing": string,
+  "tone": string,
+  "length": string
+}
+
+⚠️ Requirements:
+- intro is a 1-2 sentence opening greeting.
+- body is 2-3 paragraphs explaining fit, referencing resume & job.
+- closing is a 1-2 sentence enthusiastic closing.
+- tone should reflect the requested tone (e.g., "professional", "enthusiastic").
+- length should reflect the approximate requested length (e.g., "~250 words").
+- Output valid JSON only—no markdown or extra keys.
+- Use information from both resume and job description.
+- Extract key achievements from the resumeText automatically.
+- Ensure the tone and length match the input preferences.
+- Be concise, authentic, and contextually relevant.
+
+📥 INPUT (user message will include):
+- resumeText: the candidate's resume content (plain text).
+- jobTitle: position title.
+- companyName: name of the company.
+- jobDescription: full or excerpted job posting.
+- tone: desired tone.
+- length: approximate desired length.
+
+When given these inputs, analyze and craft a tailored cover letter fitting the schema above. Output JSON only.
+"""
+
+
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """Extract all text from a PDF using pypdf (no C extensions needed)."""
     reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
@@ -133,14 +169,14 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return full_text
 
 
-def analyze_resume(text: str) -> dict:
-    """Call Gemini and parse the JSON response."""
+def _call_gemini_json(system_prompt: str, contents: str) -> dict:
+    """Call Gemini and parse the JSON object from its response."""
     response = gemini_client.models.generate_content(
-        model="gemini-3-flash-preview",
+        model="gemini-3.8-flash",
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=system_prompt,
         ),
-        contents=text,
+        contents=contents,
     )
 
     candidate_text: str = ""
@@ -167,6 +203,33 @@ def analyze_resume(text: str) -> dict:
         raise ValueError(
             f"Invalid JSON from AI model. Received: {candidate_text[:100]}"
         ) from exc
+
+
+def analyze_resume(text: str) -> dict:
+    """Call Gemini and parse the JSON response."""
+    return _call_gemini_json(SYSTEM_PROMPT, text)
+
+
+def generate_cover_letter(
+    resume_text: str,
+    job_title: str,
+    company_name: str,
+    job_description: str,
+    tone: str,
+    length: str,
+) -> dict:
+    """Call Gemini to generate a structured cover letter."""
+    llm_input = json.dumps(
+        {
+            "resumeText": resume_text,
+            "jobTitle": job_title,
+            "companyName": company_name,
+            "jobDescription": job_description,
+            "tone": tone,
+            "length": length,
+        }
+    )
+    return _call_gemini_json(COVER_LETTER_SYSTEM_PROMPT, llm_input)
 
 
 def upload_to_imagekit(file_bytes: bytes, filename: str) -> str:
@@ -237,3 +300,65 @@ async def analyze_resume_endpoint(
         print(f"[IMAGEKIT_UPLOAD_ERROR] {exc}")
 
     return JSONResponse(content={"analysis": analysis, "url": url})
+
+
+@app.post("/generate-cover-letter")
+async def generate_cover_letter_endpoint(
+    resume: UploadFile = File(..., description="PDF resume file"),
+    job_title: str = Form(..., alias="jobTitle"),
+    company_name: str = Form(..., alias="companyName"),
+    job_description: str = Form("", alias="jobDescription"),
+    tone: str = Form(...),
+    length: str = Form(...),
+):
+    """
+    Parse a PDF resume, generate a tailored cover letter with Gemini, upload the
+    PDF to ImageKit, and return the structured cover letter with the hosted URL.
+    """
+    if resume.content_type not in ("application/pdf", "application/octet-stream"):
+        if not (resume.filename or "").lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only PDF files are accepted.",
+            )
+
+    try:
+        pdf_bytes = await resume.read()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {exc}") from exc
+
+    # --- extract text ---
+    try:
+        resume_text = extract_text_from_pdf(pdf_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF parsing error: {exc}") from exc
+
+    # --- AI cover letter generation ---
+    try:
+        cover_letter = generate_cover_letter(
+            resume_text=resume_text,
+            job_title=job_title,
+            company_name=company_name,
+            job_description=job_description,
+            tone=tone,
+            length=length,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"AI cover letter error: {exc}"
+        ) from exc
+
+    # --- upload PDF to ImageKit ---
+    try:
+        url = upload_to_imagekit(pdf_bytes, resume.filename or "resume.pdf")
+    except Exception as exc:
+        # Upload failure is non-fatal; return the cover letter without URL
+        url = None
+        print(f"[IMAGEKIT_UPLOAD_ERROR] {exc}")
+
+    return JSONResponse(content={"cover_letter": cover_letter, "pdf_url": url})
+
