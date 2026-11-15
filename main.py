@@ -3,6 +3,7 @@ import re
 import io
 import json
 import httpx
+from datetime import date
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -256,7 +257,18 @@ def _call_gemini_json(system_prompt: str, contents: str) -> dict:
 
 def analyze_resume(text: str) -> dict:
     """Call Gemini and parse the JSON response."""
-    return _call_gemini_json(SYSTEM_PROMPT, text)
+    date_context = f"""
+
+DATE VALIDATION:
+- Today is {date.today().isoformat()}.
+- Treat a date or date range as future only when its end date is after today.
+- A completed range such as July 2025 - August 2025 is in the past and must not
+  be described as a future date.
+- Do not flag past employment, education, or project dates as future dates.
+- If a date range has an ongoing or "Present" end date, treat it as current,
+  not future, unless the stated start date is after today.
+"""
+    return _call_gemini_json(SYSTEM_PROMPT + date_context, text)
 
 
 def generate_cover_letter(
