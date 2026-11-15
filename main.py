@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 import pypdf
 from imagekitio import ImageKit
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 load_dotenv()
 
@@ -21,10 +21,28 @@ IMAGEKIT_PUBLIC_KEY = os.getenv("IMAGEKIT_PUBLIC_KEY")
 IMAGEKIT_PRIVATE_KEY = os.getenv("IMAGEKIT_PRIVATE_KEY")
 IMAGEKIT_URL_ENDPOINT = os.getenv("IMAGEKIT_URL_ENDPOINT")
 
+GEMINI_MODEL = "gemini-3.8-flash"
+# Used only when the primary model is overloaded (429/5xx after retries).
+GEMINI_FALLBACK_MODEL = "gemini-3.6-flash"
+GEMINI_STABLE_MODEL = "gemini-2.5-flash"
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(
+        retry_options=types.HttpRetryOptions(
+            attempts=4,
+            initialDelay=1.0,
+            maxDelay=8.0,
+            expBase=2.0,
+            jitter=1.0,
+            httpStatusCodes=list(RETRYABLE_STATUS_CODES),
+        ),
+    ),
+)
 
 imagekit = ImageKit(private_key=IMAGEKIT_PRIVATE_KEY)
 
@@ -169,15 +187,46 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return full_text
 
 
+def _generate_with_fallback(system_prompt: str, contents: str):
+    """Call the primary Gemini model, falling back if it is overloaded."""
+    config = types.GenerateContentConfig(system_instruction=system_prompt)
+
+    try:
+        return gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            config=config,
+            contents=contents,
+        )
+    except errors.APIError as exc:
+        if exc.code not in RETRYABLE_STATUS_CODES:
+            raise
+        print(
+            f"[GEMINI_FALLBACK] {GEMINI_MODEL} returned {exc.code}; "
+            f"retrying with {GEMINI_FALLBACK_MODEL}"
+        )
+        try:
+            return gemini_client.models.generate_content(
+                model=GEMINI_FALLBACK_MODEL,
+                config=config,
+                contents=contents,
+            )
+        except errors.APIError as fallback_exc:
+            if fallback_exc.code not in RETRYABLE_STATUS_CODES:
+                raise
+            print(
+                f"[GEMINI_FALLBACK] {GEMINI_FALLBACK_MODEL} returned "
+                f"{fallback_exc.code}; retrying with {GEMINI_STABLE_MODEL}"
+            )
+            return gemini_client.models.generate_content(
+                model=GEMINI_STABLE_MODEL,
+                config=config,
+                contents=contents,
+            )
+
+
 def _call_gemini_json(system_prompt: str, contents: str) -> dict:
     """Call Gemini and parse the JSON object from its response."""
-    response = gemini_client.models.generate_content(
-        model="gemini-3.8-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-        ),
-        contents=contents,
-    )
+    response = _generate_with_fallback(system_prompt, contents)
 
     candidate_text: str = ""
     try:
@@ -251,11 +300,13 @@ def upload_to_imagekit(file_bytes: bytes, filename: str) -> str:
     return f"{endpoint}/{file_path.lstrip('/')}"
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
     return {"status": "ok"}
 
 
 @app.post("/analyze-resume")
+@app.post("/api/analyze-resume")
 async def analyze_resume_endpoint(
     resume: UploadFile = File(..., description="PDF resume file"),
 ):
@@ -303,6 +354,7 @@ async def analyze_resume_endpoint(
 
 
 @app.post("/generate-cover-letter")
+@app.post("/api/generate-cover-letter")
 async def generate_cover_letter_endpoint(
     resume: UploadFile = File(..., description="PDF resume file"),
     job_title: str = Form(..., alias="jobTitle"),
@@ -361,4 +413,3 @@ async def generate_cover_letter_endpoint(
         print(f"[IMAGEKIT_UPLOAD_ERROR] {exc}")
 
     return JSONResponse(content={"cover_letter": cover_letter, "pdf_url": url})
-
